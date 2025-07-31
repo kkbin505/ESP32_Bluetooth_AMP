@@ -9,7 +9,7 @@ extern "C" {
 void lms_init(int filter_len, float mu);
 
 // 单次更新，返回抗噪输出
-float lms_caculate(float x, float d);
+float lms_calculate(float x, float d);
 
 #ifdef __cplusplus
 }
