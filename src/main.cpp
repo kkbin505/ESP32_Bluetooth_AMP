@@ -3,12 +3,13 @@
 #include <BluetoothA2DPSink.h>
 #include <U8g2lib.h>
 #include <Wire.h>
+#include <ESP32Encoder.h>
 
 // -------------------- CONFIG --------------------
 // Choose which driver to compile for:
 #define USE_SH1106
 // #define USE_SSD1306
-#define DEBUG
+// #define DEBUG
 
 // I2S pings
 #define I2S_WS 26
@@ -41,13 +42,10 @@ const uint8_t ENC_B = 19;   // 输入专用
 const uint8_t ENC_BTN = 25; // 编码器按键（短按静音）
 const int PIN_NEXT = 33;
 const int PIN_PREV = 32;
+const int PIN_PLAY = 23; // 自行选一个空闲 GPIO
 
-// 编码器 Gray-code 解码表（四相）
-const int8_t encoderTable[16] = {
-    0, -1, 1, 0,
-    1, 0, 0, -1,
-    -1, 0, 0, 1,
-    0, 1, -1, 0};
+ESP32Encoder myEncoder;
+int32_t previousEncoderValue = 0;
 
 // 用于 ISR 与主循环通信的变量
 volatile int16_t encoderPos = 0;    // 累积的微步（每次状态变化计 +1/-1）
@@ -102,6 +100,7 @@ struct Button
 };
 Button btnNext = {PIN_NEXT, HIGH, 0, false};
 Button btnPrev = {PIN_PREV, HIGH, 0, false};
+Button btnPlay = {PIN_PLAY, HIGH, 0, false};
 
 // Then somewhere in your sketch:
 void data_received_callback()
@@ -121,11 +120,11 @@ void initButtons();
 // 按键轮询与去抖（在 loop 中调用）
 void pressButtons();
 
-void IRAM_ATTR handleEncoderISR();
+// void IRAM_ATTR handleEncoderISR();
 
-void setupEncoderPins();
+// void setupEncoderPins();
 
-void processEncoderMovement();
+// void processEncoderMovement();
 
 // 编码器按键去抖与处理（短按静音切换）
 void handleEncoderButton();
@@ -142,6 +141,8 @@ void renderUI();
 // call periodically to update scrolling
 void updateTitleScroll();
 
+void handleVolume();
+
 // -------------------- Setup / Loop --------------------
 
 void setup()
@@ -149,10 +150,8 @@ void setup()
 
 #ifdef DEBUG
   Serial.begin(115200);
-  Serial.println("Starting Bluetooth A2DP Sink with I2S...");
-#endif
-
   Serial.println("Starting A2DP + OLED display...");
+#endif
 
   // Init I2C explicitly with chosen pins
   Wire.begin(I2C_SDA, I2C_SCL);
@@ -163,6 +162,20 @@ void setup()
   // init buttons
   initButtons();
 
+  // Enable the weak pull up resistors
+  ESP32Encoder::useInternalWeakPullResistors = puType::up;
+
+  // use pin 19 and 18 for the first encoder
+  myEncoder.attachHalfQuad(ENC_A, ENC_B);
+
+  myEncoder.setCount(37);
+
+  myEncoder.clearCount();
+
+#ifdef DEBUG
+
+  Serial.println("Encoder Start = " + String((int32_t)myEncoder.getCount()));
+#endif
   // initial blank title processing
   prepareTitleForDraw();
 
@@ -213,23 +226,28 @@ void setup()
   renderUI();
 }
 
+//~~~~~~~~~~~LOOP~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
 void loop()
 {
 
-  // 处理编码器移动（发送 AVRCP）
-  processEncoderMovement();
+  // // 处理编码器移动（发送 AVRCP）
+  // processEncoderMovement();
 
-  // 处理编码器按键（短按静音）
-  handleEncoderButton();
+  // // 处理编码器按键（短按静音）
+  // handleEncoderButton();
+
   // 轮询按键
   pressButtons();
 
-  // 如果 metadata 有更新则刷新显示
+  handleVolume();
+
   // 如果 metadata 有更新则刷新显示
   if (metaUpdated)
   {
     metaUpdated = false;
     prepareTitleForDraw();
+
+#ifdef DEBUG
 
     // 打印到串口
     Serial.println("===== Song Info =====");
@@ -241,8 +259,9 @@ void loop()
     Serial.print(esp32Vol);
     Serial.println("%");
     Serial.println("=====================");
-  }
 
+#endif
+  }
   // scroll title if needed (and re-render at each scroll step)
   updateTitleScroll();
   static unsigned long lastRender = 0;
@@ -284,9 +303,6 @@ void avrc_metadata_callback(uint8_t attribute_id, const uint8_t *data)
 // 当远端设备改变本地（controller）音量时（可选）
 void avrc_rn_volumechange_callback(int vol)
 {
-  // 打印原始上报（用于调试）
-  Serial.print("AVRCP raw vol reported: ");
-  Serial.println(vol);
 
   // 有些设备上报 0..127，有些上报 0..255
   int mappedPercent;
@@ -294,7 +310,7 @@ void avrc_rn_volumechange_callback(int vol)
   // {
   //   // 很可能是 0..127
   mappedPercent = map(constrain(vol, 0, 127), 0, 127, 0, 100);
-  Serial.println("Assume scale 0..127");
+
   // }
   // else
   // {
@@ -305,9 +321,15 @@ void avrc_rn_volumechange_callback(int vol)
 
   // 更新显示变量（及可选地同步本地硬件增益）
   esp32Vol = mappedPercent;
+
+#ifdef DEBUG
+  // 打印原始上报（用于调试）
+  Serial.print("AVRCP raw vol reported: ");
+  Serial.println(vol);
   Serial.print("Mapped to percent: ");
   Serial.print(esp32Vol);
   Serial.println("%");
+#endif
 
   // 可选：把本地输出增益同步到这个百分比（如果你希望本地硬件也跟随）
   // a2dp_sink.set_volume(map(esp32Vol, 0, 100, 0, 127));
@@ -318,7 +340,7 @@ void avrc_rn_volumechange_callback(int vol)
 // 初始化按键（上拉，低电平为按下）
 void initButtons()
 {
-  Button *btns[] = {&btnNext, &btnPrev};
+  Button *btns[] = {&btnNext, &btnPrev, &btnPlay};
   for (auto b : btns)
   {
     pinMode(b->pin, INPUT_PULLUP);
@@ -354,29 +376,30 @@ void pressButtons()
           if (b == &btnNext)
           {
             a2dp_sink.next(); // AVRCP next
+#ifdef DEBUG
             Serial.println("Next ");
+#endif
           }
           else if (b == &btnPrev)
           {
             a2dp_sink.previous(); // AVRCP previous
+#ifdef DEBUG
             Serial.println("Previous ");
+#endif
           }
-          else
-        //   if (b == &btnNext)
-        //   {
-        //     Serial.println("BTN NEXT -> AVRCP PLAY/PAUSE toggle");
-        //     static bool playing = true;
-        //     if (playing)
-        //       a2dp_sink.pause();
-        //     else
-        //       a2dp_sink.play();
-        //     playing = !playing;
-        //   }
-        //   else if (b == &btnPrev)
-        //   {
-        //     Serial.println("BTN PREV -> AVRCP NEXT");
-        //     a2dp_sink.next();
-        //   }
+          else if (b == &btnPlay)
+          {
+            static bool playing = true;
+            if (playing)
+            {
+              a2dp_sink.pause();
+            }
+            else
+            {
+              a2dp_sink.play();
+            }
+            playing = !playing;
+          }
 
           metaUpdated = true;
           b->handled = true;
@@ -384,84 +407,6 @@ void pressButtons()
       }
     }
   }
-}
-
-// ISR: 在编码器 A or B 变化时调用
-void IRAM_ATTR handleEncoderISR()
-{
-  // 读取 A/B（在 ISR 中尽量快）
-  uint8_t MSB = digitalRead(ENC_A);
-  uint8_t LSB = digitalRead(ENC_B);
-  uint8_t encoded = (MSB << 1) | LSB;
-  uint8_t sum = (lastEncoded << 2) | encoded; // 4-bit 状态
-  int8_t delta = encoderTable[sum & 0x0F];
-  if (delta != 0)
-  {
-    encoderPos += delta;
-    encoderMoved = true;
-    // lastEncoded 更新为当前状态
-    lastEncoded = encoded;
-  }
-  else
-  {
-    // 也更新 lastEncoded（防止卡住）
-    lastEncoded = encoded;
-  }
-}
-
-void setupEncoderPins()
-{
-  // 编码器 A/B 为输入，建议启用内部上拉（如果编码器没有外部上拉）
-  pinMode(ENC_A, INPUT_PULLUP);
-  pinMode(ENC_B, INPUT_PULLUP);
-  pinMode(ENC_BTN, INPUT_PULLUP);
-
-  // 读取初始状态
-  uint8_t MSB = digitalRead(ENC_A);
-  uint8_t LSB = digitalRead(ENC_B);
-  lastEncoded = (MSB << 1) | LSB;
-
-  // attachInterrupt 支持在 ISR 内使用 digitalRead
-  attachInterrupt(digitalPinToInterrupt(ENC_A), handleEncoderISR, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(ENC_B), handleEncoderISR, CHANGE);
-}
-
-// 读取并处理编码器变动（在 loop 中调用）
-// 许多编码器 在每"点击"会产生4次状态变化，因此我们按 4 次计为 1 步
-void processEncoderMovement()
-{
-    static int lastProcessedPos = 0;
-    const int DETENT = 4; // 4 个微步算一个音量增减
-    int posSnapshot = 0;
-
-    noInterrupts();
-    posSnapshot = encoderPos;
-    interrupts();
-
-    int delta = posSnapshot - lastProcessedPos;
-
-    if (delta >= DETENT || delta <= -DETENT) // 只有达到 detent 才处理
-    {
-        int steps = delta / DETENT; // 实际音量变化步数
-        esp32Vol += steps;          // 每步直接加减百分比
-        esp32Vol = constrain(esp32Vol, 0, 100);
-        metaUpdated = true;
-
-        if (steps > 0)
-        {
-            for (int i = 0; i < steps; i++)
-                a2dp_sink.volume_up();
-        }
-        else
-        {
-            for (int i = 0; i < -steps; i++)
-                a2dp_sink.volume_down();
-        }
-
-        // 消耗已处理微步
-        lastProcessedPos += steps * DETENT;
-        Serial.print("Volume delta: "); Serial.println(steps);
-    }
 }
 
 // 编码器按键去抖与处理（短按静音切换）
@@ -490,21 +435,27 @@ void handleEncoderButton()
           isMuted = !isMuted;
           if (isMuted)
           {
+#ifdef DEBUG
             Serial.println("Encoder button: MUTE ON");
+#endif
             // 本地静音：把本地输出设为 0（注意：不会改变远端系统音量）
             a2dp_sink.set_volume(0);
           }
           else
           {
+#ifdef DEBUG
             Serial.println("Encoder button: MUTE OFF");
+#endif
             // 恢复到远端音量显示（若已知 esp32Vol）
-            a2dp_sink.set_volume(map(constrain(esp32Vol, 0, 100), 0, 100, 0, 255));
+            a2dp_sink.set_volume(map(constrain(esp32Vol, 0, 100), 0, 100, 0, 127));
           }
         }
         else
         {
-          // 长按可以在这里扩展其他功能
+// 长按可以在这里扩展其他功能
+#ifdef DEBUG
           Serial.println("Encoder button: LONG PRESS (no action)");
+#endif
         }
         btnHandled = true;
       }
@@ -591,13 +542,6 @@ void renderUI()
   // int ax = (SCREEN_W - artistWidth) / 2;
   // u8g2.drawUTF8(ax, 26, art.c_str());
 
-  // // Volume numeric
-  // char volbuf[16];
-  // snprintf(volbuf, sizeof(volbuf), "%d%%", esp32Vol);
-  // u8g2.setFont(INFO_FONT);
-  // u8g2.drawUTF8(4, 28, "Vol:");
-  // u8g2.drawUTF8(36, 28, volbuf);
-
   // Volume bar (x,y,w,h)
   int barW = SCREEN_W - 16;
   int barH = 10;
@@ -624,5 +568,38 @@ void updateTitleScroll()
     { // same gap as renderUI uses
       titleScrollX = 0;
     }
+  }
+}
+
+void handleVolume()
+{
+  int32_t newVal = myEncoder.getCount();
+  int32_t d = newVal - previousEncoderValue;
+  if (d != 0)
+  {
+    previousEncoderValue = newVal; // 消费到当前位置
+#ifdef DEBUG
+    Serial.println("Delta:" + String(d));
+#endif
+    int steps = d;
+    // if (d > 0) {
+    //   for (int i = 0; i < d; ++i) a2dp_sink.volume_up();
+    // } else {
+    //   for (int i = 0; i < -d; ++i) a2dp_sink.volume_down();
+    // }
+    // 否则，直接修改本地 volume（0..255 或依库而定）
+    int currentLibVol = a2dp_sink.get_volume(); // 库内部的 0..127 或 0..255，根据实现
+    // 估算映射：这里假设库使用 0..127. 你可以调整 scale
+    int stepValue = 1; // 每步改变多少库单位（试验）
+    int newVol = currentLibVol + (steps > 0 ? stepValue * steps : stepValue * steps);
+    // 限定范围，若库用 0..127 请用相应上下限
+    newVol = constrain(newVol, 0, 127);
+#ifdef DEBUG
+    Serial.printf("Setting local lib volume: %d -> %d\n", currentLibVol, newVol);
+#endif
+    a2dp_sink.set_volume(newVol);
+    // 若你还需本地显示为 0..100%，把 newVol 映射为百分比并更新 esp32Vol
+    esp32Vol = map(newVol, 0, 127, 0, 100);
+    metaUpdated = true; // 触发界面刷新
   }
 }

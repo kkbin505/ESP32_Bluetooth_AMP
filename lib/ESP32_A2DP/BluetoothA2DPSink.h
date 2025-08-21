@@ -19,9 +19,9 @@
 #include "freertos/ringbuf.h"
 
 // Comment out next line to deactivate warnings
-#ifndef A2DP_I2S_AUDIOTOOLS
-#warning "AudioTools library is not included first or installed"
-#endif
+// #ifndef A2DP_I2S_AUDIOTOOLS
+// #warning "AudioTools library is not included first or installed"
+// #endif
 
 #define APP_SIG_WORK_DISPATCH (0x01)
 
