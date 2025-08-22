@@ -9,7 +9,9 @@
 // Choose which driver to compile for:
 #define USE_SH1106
 // #define USE_SSD1306
-// #define DEBUG
+#define DEBUG
+
+#define BLUETOOTH_NAME "ESP32_Speaker_2.0" // 与蓝牙启动时的名称保持一致
 
 // I2S pings
 #define I2S_WS 26
@@ -37,12 +39,12 @@ const int TITLE_SCROLL_MARGIN = 4;
 
 // 编码器引脚（示例）
 // A/B 使用输入引脚，建议使用不带内部上拉的大多数引脚或启用上拉
-const uint8_t ENC_A = 18;   // 输入专用引脚示例（ESP32 输入引脚）
-const uint8_t ENC_B = 19;   // 输入专用
-const uint8_t ENC_BTN = 25; // 编码器按键（短按静音）
-const int PIN_NEXT = 33;
-const int PIN_PREV = 32;
-const int PIN_PLAY = 23; // 自行选一个空闲 GPIO
+const uint8_t ENC_A = 18; // 输入专用引脚示例（ESP32 输入引脚）
+const uint8_t ENC_B = 19; // 输入专用
+// const uint8_t ENC_BTN = 25; // 编码器按键（短按静音）
+const uint8_t PIN_NEXT = 25;
+const uint8_t PIN_PLAY = 32;
+const uint8_t PIN_PREV = 33;
 
 ESP32Encoder myEncoder;
 int32_t previousEncoderValue = 0;
@@ -58,6 +60,10 @@ unsigned long btnLastChange = 0;
 bool btnHandled = false;
 unsigned long btnPressTime = 0;
 bool isMuted = false; // 编码器按键短按用于静音切换
+
+// 蓝牙连接状态：
+// 在全局变量区域添加连接状态标志
+volatile bool isBluetoothConnected = false; // 蓝牙连接状态标志
 
 // 去抖参数
 // 原有去抖常量（你文件里已有 DEBOUNCE_MS = 50）
@@ -120,15 +126,6 @@ void initButtons();
 // 按键轮询与去抖（在 loop 中调用）
 void pressButtons();
 
-// void IRAM_ATTR handleEncoderISR();
-
-// void setupEncoderPins();
-
-// void processEncoderMovement();
-
-// 编码器按键去抖与处理（短按静音切换）
-void handleEncoderButton();
-
 // -------------------- Display helpers --------------------
 void prepareTitleForDraw();
 
@@ -140,6 +137,9 @@ void renderUI();
 
 // call periodically to update scrolling
 void updateTitleScroll();
+
+// Device Name befor connection
+void showBluetoothNameBeforeConnect();
 
 void handleVolume();
 
@@ -159,6 +159,7 @@ void setup()
   // init u8g2
   u8g2.begin();
 
+  showBluetoothNameBeforeConnect();
   // init buttons
   initButtons();
 
@@ -187,54 +188,43 @@ void setup()
       .data_in_num = I2S_PIN_NO_CHANGE};
   a2dp_sink.set_pin_config(my_pin_config);
 
-  // 设置为可记忆设备,上电自动连接
-  // a2dp_sink.set_auto_reconnect(true);
-
-  // 请求我们感兴趣的 metadata 字段（Title + Artist）
-  // 使用 esp-avrc 常量的位掩码（library 接受 ESP_AVRC_MD_ATTR_*）
-  a2dp_sink.set_avrc_metadata_attribute_mask(ESP_AVRC_MD_ATTR_TITLE | ESP_AVRC_MD_ATTR_ARTIST);
-
-  // 注册 metadata 回调
-  a2dp_sink.set_avrc_metadata_callback(avrc_metadata_callback);
-
-  // 可选：注册当远端改变音量的通知（这样显示可被远端音量同步）
-  a2dp_sink.set_avrc_rn_volumechange(avrc_rn_volumechange_callback);
-
-  // 设置初始音量（0~255）
-  uint8_t vol_255 = map(esp32Vol, 0, 100, 0, 255);
-  a2dp_sink.set_volume(vol_255);
-
-  // 放在 setup() 里，start() 之前：
+  // 只在这里注册一次蓝牙连接状态回调（关键修复）
   a2dp_sink.set_on_connection_state_changed([](esp_a2d_connection_state_t state, void *)
                                             {
   Serial.print("[A2DP] connection state: ");
-  Serial.println((int)state); });
+  Serial.println((int)state);
+  
+  // 根据连接状态更新显示
+  if (state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
+    // 连接建立，刷新为正常UI
+    metaUpdated = true;  // 触发正常UI渲染
+     isBluetoothConnected = true;
+  } else if (state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
+    // 连接断开，重新显示蓝牙名称
+    showBluetoothNameBeforeConnect();
+    isBluetoothConnected = false;
+    
+  } });
+
+  // 其他蓝牙配置...
+  a2dp_sink.set_avrc_metadata_attribute_mask(ESP_AVRC_MD_ATTR_TITLE | ESP_AVRC_MD_ATTR_ARTIST);
+  a2dp_sink.set_avrc_metadata_callback(avrc_metadata_callback);
+  a2dp_sink.set_avrc_rn_volumechange(avrc_rn_volumechange_callback);
+
+  uint8_t vol_255 = map(esp32Vol, 0, 100, 0, 255);
+  a2dp_sink.set_volume(vol_255);
 
   a2dp_sink.set_avrc_connection_state_callback([](bool connected)
                                                {
   Serial.print("[AVRCP] connected: ");
   Serial.println(connected ? "YES" : "NO"); });
 
-  // a2dp_sink.set_stream_reader(read_data_stream);
-  a2dp_sink.start("ESP32_Speaker_2.0");
-// In the setup function:
-#ifdef DEBUG
-  a2dp_sink.set_on_data_received(data_received_callback);
-#endif
-
-  // initial render
-  renderUI();
+  a2dp_sink.start(BLUETOOTH_NAME); // 使用定义的蓝牙名称
 }
 
 //~~~~~~~~~~~LOOP~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
 void loop()
 {
-
-  // // 处理编码器移动（发送 AVRCP）
-  // processEncoderMovement();
-
-  // // 处理编码器按键（短按静音）
-  // handleEncoderButton();
 
   // 轮询按键
   pressButtons();
@@ -242,7 +232,7 @@ void loop()
   handleVolume();
 
   // 如果 metadata 有更新则刷新显示
-  if (metaUpdated)
+  if (isBluetoothConnected && metaUpdated)
   {
     metaUpdated = false;
     prepareTitleForDraw();
@@ -261,15 +251,16 @@ void loop()
     Serial.println("=====================");
 
 #endif
-  }
-  // scroll title if needed (and re-render at each scroll step)
-  updateTitleScroll();
-  static unsigned long lastRender = 0;
-  // throttle renders to avoid burning CPU — render on scroll step or every 500ms
-  if (millis() - lastRender > 500 || titlePixelWidth + TITLE_SCROLL_MARGIN > SCREEN_W)
-  {
-    renderUI();
-    lastRender = millis();
+
+    // scroll title if needed (and re-render at each scroll step)
+    updateTitleScroll();
+    static unsigned long lastRender = 0;
+    // throttle renders to avoid burning CPU — render on scroll step or every 500ms
+    if (millis() - lastRender > 500 || titlePixelWidth + TITLE_SCROLL_MARGIN > SCREEN_W)
+    {
+      renderUI();
+      lastRender = millis();
+    }
   }
   delay(10);
 }
@@ -337,6 +328,7 @@ void avrc_rn_volumechange_callback(int vol)
   metaUpdated = true;
 }
 
+// -------------------- Button  Functions--------------------
 // 初始化按键（上拉，低电平为按下）
 void initButtons()
 {
@@ -353,7 +345,7 @@ void initButtons()
 // 按键轮询与去抖（在 loop 中调用）
 void pressButtons()
 {
-  Button *btns[] = {&btnNext, &btnPrev};
+  Button *btns[] = {&btnNext, &btnPrev, &btnPlay};
   for (auto b : btns)
   {
     bool cur = digitalRead(b->pin);
@@ -410,68 +402,100 @@ void pressButtons()
 }
 
 // 编码器按键去抖与处理（短按静音切换）
-void handleEncoderButton()
+// void handleEncoderButton()
+// {
+//   bool cur = digitalRead(ENC_BTN);
+//   if (cur != btnLast)
+//   {
+//     btnLastChange = millis();
+//     btnLast = cur;
+//     btnHandled = false;
+//     if (cur == LOW)
+//     {
+//       btnPressTime = millis(); // 记录按下时间
+//     }
+//     else
+//     {
+//       // 按键释放
+//       unsigned long held = millis() - btnPressTime;
+//       if (!btnHandled && (held >= BTN_LONGPRESS_MS))
+//       {
+//         // 短按（释放时触发）
+//         if (held < BTN_LONGPRESS_MS)
+//         {
+//           // 切换静音（示例）
+//           isMuted = !isMuted;
+//           if (isMuted)
+//           {
+// #ifdef DEBUG
+//             Serial.println("Encoder button: MUTE ON");
+// #endif
+//             // 本地静音：把本地输出设为 0（注意：不会改变远端系统音量）
+//             a2dp_sink.set_volume(0);
+//           }
+//           else
+//           {
+// #ifdef DEBUG
+//             Serial.println("Encoder button: MUTE OFF");
+// #endif
+//             // 恢复到远端音量显示（若已知 esp32Vol）
+//             a2dp_sink.set_volume(map(constrain(esp32Vol, 0, 100), 0, 100, 0, 127));
+//           }
+//         }
+//         else
+//         {
+// // 长按可以在这里扩展其他功能
+// #ifdef DEBUG
+//           Serial.println("Encoder button: LONG PRESS (no action)");
+// #endif
+//         }
+//         btnHandled = true;
+//       }
+//     }
+//   }
+//   else
+//   {
+//     // 状态稳定
+//     if (!btnHandled && (millis() - btnLastChange) > BTN_LONGPRESS_MS)
+//     {
+//       // nothing to do, 等待 release 处理；避免重复
+//     }
+//   }
+// }
+void handleVolume()
 {
-  bool cur = digitalRead(ENC_BTN);
-  if (cur != btnLast)
+  int32_t newVal = myEncoder.getCount();
+  int32_t d = newVal - previousEncoderValue;
+  if (d != 0)
   {
-    btnLastChange = millis();
-    btnLast = cur;
-    btnHandled = false;
-    if (cur == LOW)
-    {
-      btnPressTime = millis(); // 记录按下时间
-    }
-    else
-    {
-      // 按键释放
-      unsigned long held = millis() - btnPressTime;
-      if (!btnHandled && (held >= BTN_LONGPRESS_MS))
-      {
-        // 短按（释放时触发）
-        if (held < BTN_LONGPRESS_MS)
-        {
-          // 切换静音（示例）
-          isMuted = !isMuted;
-          if (isMuted)
-          {
+    previousEncoderValue = newVal; // 消费到当前位置
 #ifdef DEBUG
-            Serial.println("Encoder button: MUTE ON");
+    Serial.println("Delta:" + String(d));
 #endif
-            // 本地静音：把本地输出设为 0（注意：不会改变远端系统音量）
-            a2dp_sink.set_volume(0);
-          }
-          else
-          {
+    int steps = d;
+    // if (d > 0) {
+    //   for (int i = 0; i < d; ++i) a2dp_sink.volume_up();
+    // } else {
+    //   for (int i = 0; i < -d; ++i) a2dp_sink.volume_down();
+    // }
+    // 否则，直接修改本地 volume（0..255 或依库而定）
+    int currentLibVol = a2dp_sink.get_volume(); // 库内部的 0..127 或 0..255，根据实现
+    // 估算映射：这里假设库使用 0..127. 你可以调整 scale
+    int stepValue = 1; // 每步改变多少库单位（试验）
+    int newVol = currentLibVol + (steps > 0 ? stepValue * steps : stepValue * steps);
+    // 限定范围，若库用 0..127 请用相应上下限
+    newVol = constrain(newVol, 0, 127);
 #ifdef DEBUG
-            Serial.println("Encoder button: MUTE OFF");
+    Serial.printf("Setting local lib volume: %d -> %d\n", currentLibVol, newVol);
 #endif
-            // 恢复到远端音量显示（若已知 esp32Vol）
-            a2dp_sink.set_volume(map(constrain(esp32Vol, 0, 100), 0, 100, 0, 127));
-          }
-        }
-        else
-        {
-// 长按可以在这里扩展其他功能
-#ifdef DEBUG
-          Serial.println("Encoder button: LONG PRESS (no action)");
-#endif
-        }
-        btnHandled = true;
-      }
-    }
-  }
-  else
-  {
-    // 状态稳定
-    if (!btnHandled && (millis() - btnLastChange) > BTN_LONGPRESS_MS)
-    {
-      // nothing to do, 等待 release 处理；避免重复
-    }
+    a2dp_sink.set_volume(newVol);
+    // 若你还需本地显示为 0..100%，把 newVol 映射为百分比并更新 esp32Vol
+    esp32Vol = map(newVol, 0, 127, 0, 100);
+    metaUpdated = true; // 触发界面刷新
   }
 }
 
-// -------------------- Display helpers --------------------
+// -------------------- Display Functions--------------------
 void prepareTitleForDraw()
 {
   // make a stable local copy so we don't read volatile String while drawing
@@ -571,35 +595,18 @@ void updateTitleScroll()
   }
 }
 
-void handleVolume()
+// 蓝牙未连接时显示蓝牙名称
+void showBluetoothNameBeforeConnect()
 {
-  int32_t newVal = myEncoder.getCount();
-  int32_t d = newVal - previousEncoderValue;
-  if (d != 0)
-  {
-    previousEncoderValue = newVal; // 消费到当前位置
-#ifdef DEBUG
-    Serial.println("Delta:" + String(d));
-#endif
-    int steps = d;
-    // if (d > 0) {
-    //   for (int i = 0; i < d; ++i) a2dp_sink.volume_up();
-    // } else {
-    //   for (int i = 0; i < -d; ++i) a2dp_sink.volume_down();
-    // }
-    // 否则，直接修改本地 volume（0..255 或依库而定）
-    int currentLibVol = a2dp_sink.get_volume(); // 库内部的 0..127 或 0..255，根据实现
-    // 估算映射：这里假设库使用 0..127. 你可以调整 scale
-    int stepValue = 1; // 每步改变多少库单位（试验）
-    int newVol = currentLibVol + (steps > 0 ? stepValue * steps : stepValue * steps);
-    // 限定范围，若库用 0..127 请用相应上下限
-    newVol = constrain(newVol, 0, 127);
-#ifdef DEBUG
-    Serial.printf("Setting local lib volume: %d -> %d\n", currentLibVol, newVol);
-#endif
-    a2dp_sink.set_volume(newVol);
-    // 若你还需本地显示为 0..100%，把 newVol 映射为百分比并更新 esp32Vol
-    esp32Vol = map(newVol, 0, 127, 0, 100);
-    metaUpdated = true; // 触发界面刷新
-  }
+  u8g2.clearBuffer();
+  u8g2.setFont(TITLE_FONT); // 使用标题字体显示蓝牙名称
+
+  u8g2.drawUTF8(0,8, "Device Name:"); // 底部显示提示
+  // 计算蓝牙名称的宽度，居中显示
+  int nameWidth = u8g2.getUTF8Width(BLUETOOTH_NAME);
+  int x = (SCREEN_W - nameWidth) / 2;  // 水平居中
+  int y = SCREEN_H / 2 +6;            // 垂直居中（根据字体调整偏移）
+  u8g2.drawUTF8(x, y, BLUETOOTH_NAME); // 绘制蓝牙名称
+
+  u8g2.sendBuffer();
 }
