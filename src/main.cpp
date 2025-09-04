@@ -4,18 +4,19 @@
 #include <U8g2lib.h>
 #include <Wire.h>
 #include <ESP32Encoder.h>
+#include <esp_pm.h> // 电源管理库
 
 // -------------------- CONFIG --------------------
 // Choose which driver to compile for:
 
-#define USE_SH1106
+// #define USE_SH1106
 // #define USE_SSD1306
-#define DEBUG
+// #define DEBUG
 
 // #define USE_BUTTON
-#define USE_ENCODER
+// #define USE_ENCODER
 
-#define BLUETOOTH_NAME "ESP32_AMP" // 与蓝牙启动时的名称保持一致
+#define BLUETOOTH_NAME "ESP32_AMP2" // 与蓝牙启动时的名称保持一致
 
 // I2S pings
 // Old design //25 26 14
@@ -30,8 +31,11 @@
 #define PCM5102_FMT_PIN 33
 #define PCM5102_XMT_PIN 32
 
+// 低功耗配置
+#define SLEEP_INTERVAL 50  // 主循环休眠间隔(ms)
+
 #if defined(USE_SH1106) || defined(USE_SSD1306)
-// I2C pins
+// OLE I2C pins
 #define I2C_SDA 21
 #define I2C_SCL 22
 #define I2C_ADDR 0x3C
@@ -98,7 +102,7 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R2, /* reset=*/U8X8_PIN_NONE, /*sc
 #endif
 #endif
 
-int8_t esp32Vol = 10; // 0~100
+int8_t esp32Vol = 8; // 0~100
 
 String metaTitle = "--";
 String metaArtist = "--";
@@ -168,7 +172,10 @@ void avrc_metadata_callback(uint8_t attribute_id, const uint8_t *data);
 // 当远端设备改变本地（controller）音量时（可选）
 void avrc_rn_volumechange_callback(int vol);
 
-void handleVolume();
+// void handleVolume();
+
+// -------------------- 电源管理 --------------------
+void setupPowerManagement();
 
 // -------------------- Setup / Loop --------------------
 
@@ -180,14 +187,16 @@ void setup()
   Serial.println("Starting A2DP + OLED display...");
 #endif
 
+  setupPowerManagement();
+
   pinMode(PCM5102_FMT_PIN, OUTPUT);
   pinMode(PCM5102_XMT_PIN, OUTPUT);
-  pinMode(LED,OUTPUT);
+  pinMode(LED, OUTPUT);
 
   // 输出高电平
-  digitalWrite(PCM5102_FMT_PIN, LOW);  // I2S Mode
-  digitalWrite(PCM5102_XMT_PIN, HIGH); // Enable output
-  digitalWrite(LED, LOW);
+  // digitalWrite(PCM5102_FMT_PIN, LOW);  // I2S Mode
+  // digitalWrite(PCM5102_XMT_PIN, HIGH); // Enable output
+  digitalWrite(LED, HIGH);
 
 #if defined(USE_SH1106) || defined(USE_SSD1306)
   // Init I2C explicitly with chosen pins
@@ -232,25 +241,30 @@ void setup()
   // 只在这里注册一次蓝牙连接状态回调（关键修复）
   a2dp_sink.set_on_connection_state_changed([](esp_a2d_connection_state_t state, void *)
                                             {
+#ifdef DEBUG
                                               Serial.print("[A2DP] connection state: ");
                                               Serial.println((int)state);
-#if defined(USE_SH1106) || defined(USE_SSD1306)
-                                              // 根据连接状态更新显示
+#endif
                                               if (state == ESP_A2D_CONNECTION_STATE_CONNECTED)
                                               {
+                                                digitalWrite(LED, HIGH);
+#if defined(USE_SH1106) || defined(USE_SSD1306)
+                                                // 根据连接状态更新显示
+
                                                 // 连接建立，刷新为正常UI
                                                 metaUpdated = true; // 触发正常UI渲染
                                                 isBluetoothConnected = true;
-                                                digitalWrite(LED, HIGH);
+#endif
                                               }
                                               else if (state == ESP_A2D_CONNECTION_STATE_DISCONNECTED)
                                               {
+                                                digitalWrite(LED, LOW);
+#if defined(USE_SH1106) || defined(USE_SSD1306)
                                                 // 连接断开，重新显示蓝牙名称
                                                 showBluetoothNameBeforeConnect();
                                                 isBluetoothConnected = false;
-                                                digitalWrite(LED, LOW);
-                                              }
 #endif
+                                              }
                                             });
   // 其他蓝牙配置...
   a2dp_sink.set_avrc_metadata_attribute_mask(ESP_AVRC_MD_ATTR_TITLE | ESP_AVRC_MD_ATTR_ARTIST);
@@ -262,9 +276,11 @@ void setup()
 
   a2dp_sink.set_avrc_connection_state_callback([](bool connected)
                                                {
-  Serial.print("[AVRCP] connected: ");
-  Serial.println(connected ? "YES" : "NO"); });
-
+#ifdef DEBUG
+                                                 Serial.print("[AVRCP] connected: ");
+                                                 Serial.println(connected ? "YES" : "NO");
+#endif
+                                               });
   a2dp_sink.start(BLUETOOTH_NAME); // 使用定义的蓝牙名称
 }
 
@@ -272,7 +288,7 @@ void setup()
 void loop()
 {
 
-  handleVolume();
+  // handleVolume();
 
 #if defined(USE_SH1106) || defined(USE_SSD1306)
   // 轮询按键
@@ -315,7 +331,10 @@ void loop()
     }
   }
 #endif
-  delay(10);
+  // delay(1000);
+      // 进入轻量级休眠
+    // esp_light_sleep_start();
+    // delay(SLEEP_INTERVAL);  // 延长休眠间隔
 }
 
 // 将 AVRCP 元数据转换并存储
@@ -347,7 +366,6 @@ void avrc_metadata_callback(uint8_t attribute_id, const uint8_t *data)
 // 当远端设备改变本地（controller）音量时（可选）
 void avrc_rn_volumechange_callback(int vol)
 {
-
   // 有些设备上报 0..127，有些上报 0..255
   int mappedPercent;
   // if (vol <= 127)
@@ -610,3 +628,14 @@ void showBluetoothNameBeforeConnect()
   u8g2.sendBuffer();
 }
 #endif
+
+void setupPowerManagement()
+{
+  // 配置电源管理策略
+  esp_pm_config_esp32_t pm_config = {
+      .max_freq_mhz = 80, // 降低CPU最大频率
+      .min_freq_mhz = 40,
+      // .light_sleep_enable = true // 允许轻量级休眠
+  };
+  esp_pm_configure(&pm_config);
+}
